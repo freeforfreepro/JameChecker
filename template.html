@@ -1,0 +1,433 @@
+# Create an Android Studio project skeleton + mobile HTML builder for offline APK
+import os, shutil, zipfile
+from PIL import Image
+
+base = "/mnt/data/JameChecker-APK-Starter"
+if os.path.exists(base):
+    shutil.rmtree(base)
+os.makedirs(base, exist_ok=True)
+
+# 1) Mobile offline HTML template (same as earlier approach, placeholders to be embedded by builder.ps1)
+mobile_dir = os.path.join(base, "mobile")
+os.makedirs(mobile_dir, exist_ok=True)
+template_html = """<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>JameChecker – Mobile Offline</title>
+  <style>
+    html,body,#app{height:100%;margin:0;background:#0b0b0f;color:#fff;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto}
+    .wrap{max-width:680px;margin:0 auto;padding:14px}
+    .card{background:#11131a;border:1px solid #1f2330;border-radius:16px;box-shadow:0 12px 30px rgba(0,0,0,.25);padding:14px}
+    .btn{padding:12px 14px;border-radius:12px;border:1px solid #2a2f3e;background:#171a23;color:#fff}
+    .btn.primary{background:#e11d48;border-color:#e11d48}
+    .hint{color:#a0a3ad;font-size:12px}
+    .grid{display:grid;gap:12px}
+  </style>
+</head>
+<body>
+<div id="app">
+  <div class="wrap">
+    <div class="grid">
+      <div class="card">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="width:40px;height:40px;border-radius:12px;background:#e11d48;display:grid;place-items:center;font-weight:800">JC</div>
+          <div>
+            <div style="font-weight:800">JameChecker</div>
+            <div class="hint">Offline OCR • Duplicate Tag Highlighter</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div>เลือกรูป/ถ่ายภาพ</div>
+        <div id="pick" class="btn" style="margin-top:8px;text-align:center">เลือกไฟล์ภาพ</div>
+        <input id="file" type="file" accept="image/*;capture=camera" style="display:none"/>
+        <div class="hint" style="margin-top:6px">แนะนำ: ถ่ายให้ชัด เต็มเฟรม แสงพอ</div>
+
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <div style="flex:1">
+            <div class="hint">Downscale</div>
+            <input id="scale" type="range" min="0.5" max="1.0" step="0.05" value="1.0" style="width:100%"/>
+          </div>
+          <div style="flex:1">
+            <div class="hint">Threshold</div>
+            <input id="thr" type="range" min="0" max="140" step="5" value="0" style="width:100%"/>
+          </div>
+        </div>
+
+        <div style="margin-top:8px">
+          <div class="hint">Regex</div>
+          <input id="regex" value="\\b[A-Z]{3}\\d{6}\\b" style="width:100%;padding:10px;border-radius:10px;border:1px solid #2a2f3e;background:#0d0f16;color:#fff"/>
+        </div>
+
+        <div id="busy" style="display:none;margin-top:10px">
+          <div style="display:flex;justify-content:space-between"><span>OCR...</span><span id="pct">0%</span></div>
+          <div style="height:8px;background:#22283a;border-radius:999px;overflow:hidden"><div id="bar" style="height:8px;background:#22d3ee;width:0%"></div></div>
+        </div>
+        <div id="err" style="display:none;margin-top:8px;color:#fecaca;background:#7f1d1d;border:1px solid #ef4444;border-radius:10px;padding:8px;font-size:13px"></div>
+      </div>
+
+      <div class="card">
+        <div class="hint">Preview</div>
+        <canvas id="cv" style="width:100%;max-height:55vh;border-radius:12px;border:1px solid #2a2f3e"></canvas>
+      </div>
+
+      <div class="card">
+        <div>สรุปแท็กซ้ำ</div>
+        <div id="summary" class="hint" style="margin-top:6px">ยังไม่พบแท็กซ้ำ</div>
+        <div style="display:flex;gap:8px;margin-top:10px">
+          <div id="savepng" class="btn primary" style="flex:1;text-align:center">บันทึกภาพ</div>
+          <div id="savecsv" class="btn" style="flex:1;text-align:center">CSV</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Inline libs to be injected -->
+<script>
+// __REACT_JS__
+</script>
+<script>
+// __REACTDOM_JS__
+</script>
+<script>
+// __TESSERACT_JS__
+</script>
+<script>
+window.__TESS_WORKER_B64__="__WORKER_B64__";
+window.__TESS_WASM_B64__="__WASM_B64__";
+window.__ENG_GZ_B64__="__ENG_GZ_B64__";
+</script>
+
+<script>
+(function(){
+  const {useEffect,useRef,useState}=React;
+
+  function App(){
+    const cvRef=useRef(null); const img=new Image(); img.decoding='async';
+    const [dups,setDups]=useState({}); const [pct,setPct]=useState(0);
+
+    useEffect(()=>{
+      const pick=document.getElementById('pick');
+      const file=document.getElementById('file');
+      pick.addEventListener('click',()=>file.click());
+      file.addEventListener('change',e=> e.target.files[0] && handleFile(e.target.files[0]));
+      document.getElementById('savepng').addEventListener('click',savePNG);
+      document.getElementById('savecsv').addEventListener('click',saveCSV);
+    },[]);
+
+    function b64ToURL(b64, mime){
+      const bin=atob(b64); const bytes=new Uint8Array(bin.length);
+      for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      return URL.createObjectURL(new Blob([bytes],{type:mime}));
+    }
+
+    async function handleFile(f){
+      try{
+        const url=URL.createObjectURL(f);
+        await runOCR(url);
+      }catch(e){ showErr(e?.message||String(e)); }
+    }
+
+    async function runOCR(url){
+      const workerURL=b64ToURL(window.__TESS_WORKER_B64__,'application/javascript');
+      const wasmURL  =b64ToURL(window.__TESS_WASM_B64__,'application/wasm');
+      const { createWorker }=Tesseract;
+      const worker=await createWorker({ logger:m=>typeof m?.progress==='number' && setPct(Math.round(m.progress*100)), workerPath:workerURL, corePath:wasmURL });
+      await worker.load(); await worker.loadLanguage('eng'); await worker.initialize('eng');
+
+      const prepped=await preprocess(url);
+      const { data }=await worker.recognize(prepped);
+      const regex=new RegExp(document.getElementById('regex').value,'g');
+      const counts={}; const hits=[];
+      (data.words||[]).forEach(w=>{
+        const t=(w.text||'').toUpperCase(); const arr=t.match(regex)||[];
+        arr.forEach(tag=>{ counts[tag]=(counts[tag]||0)+1; hits.push({tag,bbox:w.bbox||{x0:w.x0,y0:w.y0,x1:w.x1,y1:w.y1}}); });
+      });
+      const dups=Object.fromEntries(Object.entries(counts).filter(([_,c])=>c>=2));
+      setDups(dups);
+      await draw(url, hits.filter(h=>dups[h.tag]));
+      await worker.terminate();
+    }
+
+    async function preprocess(url){
+      const scale=parseFloat(document.getElementById('scale').value);
+      const thr=parseInt(document.getElementById('thr').value,10);
+      const cv=document.createElement('canvas'); const cx=cv.getContext('2d',{willReadFrequently:true});
+      await new Promise(res=>{ img.onload=()=>res(); img.src=url; if(img.complete) res(); });
+      const W=Math.round(img.naturalWidth*scale), H=Math.round(img.naturalHeight*scale);
+      cv.width=W; cv.height=H; cx.drawImage(img,0,0,W,H);
+      if(thr>0){ const im=cx.getImageData(0,0,W,H),d=im.data; for(let i=0;i<d.length;i+=4){ const y=0.299*d[i]+0.587*d[i+1]+0.114*d[i+2]; const v=y>thr?255:0; d[i]=d[i+1]=d[i+2]=v;} cx.putImageData(im,0,0); }
+      return cv.toDataURL('image/png');
+    }
+
+    async function draw(url,hits){
+      const cv=cvRef.current; const cx=cv.getContext('2d');
+      await new Promise(res=>{ img.onload=()=>res(); img.src=url; if(img.complete) res(); });
+      cv.width=img.naturalWidth; cv.height=img.naturalHeight;
+      cx.clearRect(0,0,cv.width,cv.height); cx.drawImage(img,0,0,cv.width,cv.height);
+      cx.lineWidth=Math.max(2,Math.round((cv.width+cv.height)/1000));
+      cx.font=`${Math.max(12,Math.round(cv.width/60))}px sans-serif`;
+      hits.forEach(h=>{ const b=h.bbox; const x0=b.x0,y0=b.y0,x1=b.x1,y1=b.y1; cx.strokeStyle='#ef4444'; cx.fillStyle='rgba(239,68,68,.16)'; cx.strokeRect(x0,y0,x1-x0,y1-y0); cx.fillRect(x0,y0,x1-x0,y1-y0); const lab=h.tag,tw=cx.measureText(lab).width+10,th=Math.max(20,Math.round(cv.width/60)+8); cx.fillStyle='#ef4444'; cx.fillRect(x0,Math.max(0,y0-th),tw,th); cx.fillStyle='#fff'; cx.fillText(lab,x0+6,Math.max(14,y0-6)); });
+      document.getElementById('summary').textContent=Object.keys(dups).length?Object.entries(dups).map(([k,v])=>`${k}: ${v}`).join(' • '):'ยังไม่พบแท็กซ้ำ';
+    }
+
+    function showErr(msg){ const e=document.getElementById('err'); e.style.display='block'; e.textContent=msg; }
+    function savePNG(){ const a=document.createElement('a'); a.href=cvRef.current.toDataURL('image/png'); a.download=`jame_mobile_${Date.now()}.png`; a.click(); }
+    function saveCSV(){ const lines=['tag,count']; Object.entries(dups).forEach(([k,v])=>lines.push(`${k},${v}`)); const blob=new Blob([lines.join('\\n')],{type:'text/csv'}); const url=URL.createObjectURL(blob); const a=document.createElement('a'); a.href=url; a.download='jame_mobile.csv'; a.click(); URL.revokeObjectURL(url); }
+
+    return React.createElement('div',null,
+      React.createElement('canvas',{id:'cv',ref:cvRef})
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('app')).render(React.createElement(App));
+})();
+</script>
+</body>
+</html>
+"""
+open(os.path.join(mobile_dir,"template.html"),"w",encoding="utf-8").write(template_html)
+
+builder_ps1 = r"""# Build mobile offline single-file (inject libs/model into template.html)
+$ErrorActionPreference = "Stop"
+$here = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $here
+
+function Get-Base64([string]$Url){
+  Write-Host "Downloading (bin): $Url"
+  $bytes = Invoke-WebRequest -Uri $Url -UseBasicParsing | Select-Object -ExpandProperty Content
+  if ($bytes -is [string]){ $bytes = [System.Text.Encoding]::UTF8.GetBytes($bytes) }
+  [Convert]::ToBase64String($bytes)
+}
+function Get-Text([string]$Url){
+  Write-Host "Downloading (text): $Url"
+  (Invoke-WebRequest -Uri $Url -UseBasicParsing).Content
+}
+
+$react = "https://unpkg.com/react@18/umd/react.production.min.js"
+$reactdom = "https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"
+$tesseract = "https://unpkg.com/tesseract.js@5.1.0/dist/tesseract.min.js"
+$worker = "https://unpkg.com/tesseract.js@5.1.0/dist/worker.min.js"
+$wasm = "https://unpkg.com/tesseract.js-core@5.1.0/tesseract-core.wasm"
+$eng = "https://raw.githubusercontent.com/naptha/tessdata/gh-pages/4.0.0/eng.traineddata.gz"
+
+$reactTxt = Get-Text $react
+$reactdomTxt = Get-Text $reactdom
+$tessTxt = Get-Text $tesseract
+$workerB64 = Get-Base64 $worker
+$wasmB64 = Get-Base64 $wasm
+$engB64 = Get-Base64 $eng
+
+$template = Get-Content -Raw -Encoding UTF8 "$here\template.html"
+$template = $template -replace '\_\_REACT_JS\_\_', [Regex]::Escape($reactTxt).Replace("`r","").Replace("`n","`n")
+$template = $template -replace '\_\_REACTDOM_JS\_\_', [Regex]::Escape($reactdomTxt).Replace("`r","").Replace("`n","`n")
+$template = $template -replace '\_\_TESSERACT_JS\_\_', [Regex]::Escape($tessTxt).Replace("`r","").Replace("`n","`n")
+$template = $template -replace '\_\_WORKER_B64\_\_', $workerB64
+$template = $template -replace '\_\_WASM_B64\_\_', $wasmB64
+$template = $template -replace '\_\_ENG_GZ_B64\_\_', $engB64
+
+$out = "$here\JameChecker_Offline_Mobile.html"
+Set-Content -Encoding UTF8 -Path $out -Value $template
+Write-Host "✅ Built $out" -ForegroundColor Green
+"""
+open(os.path.join(mobile_dir,"builder.ps1"),"w",encoding="utf-8").write(builder_ps1)
+
+# 2) Android project skeleton
+proj = os.path.join(base, "android-project")
+app_dir = os.path.join(proj, "app")
+main = os.path.join(app_dir, "src", "main")
+assets_www = os.path.join(main, "assets", "www")
+os.makedirs(assets_www, exist_ok=True)
+# placeholder index
+open(os.path.join(assets_www,"index.html"),"w",encoding="utf-8").write("<!-- place JameChecker_Offline_Mobile.html here after building -->")
+
+# Gradle files
+open(os.path.join(proj,"settings.gradle"),"w").write("rootProject.name = 'JameChecker'\ninclude ':app'\n")
+open(os.path.join(proj,"build.gradle"),"w").write("""
+buildscript {
+    repositories { google(); mavenCentral() }
+    dependencies { classpath 'com.android.tools.build:gradle:8.4.2' }
+}
+allprojects { repositories { google(); mavenCentral() } }
+task clean(type: Delete) { delete rootProject.buildDir }
+""")
+os.makedirs(os.path.join(app_dir), exist_ok=True)
+open(os.path.join(app_dir,"build.gradle"),"w").write("""
+plugins { id 'com.android.application' }
+android {
+    namespace 'com.jamechecker.app'
+    compileSdk 34
+    defaultConfig {
+        applicationId "com.jamechecker.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+    buildTypes { release { minifyEnabled false } }
+}
+dependencies { }
+""")
+
+# Manifest with portrait lock and no Internet permission
+manifest = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.jamechecker.app">
+    <application
+        android:allowBackup="true"
+        android:label="JameChecker"
+        android:icon="@mipmap/ic_launcher"
+        android:theme="@style/Theme.JameChecker">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:screenOrientation="portrait">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+"""
+os.makedirs(main, exist_ok=True)
+open(os.path.join(main,"AndroidManifest.xml"),"w",encoding="utf-8").write(manifest)
+
+# Simple theme
+res_dir = os.path.join(main,"res")
+values = os.path.join(res_dir,"values")
+os.makedirs(values, exist_ok=True)
+open(os.path.join(values,"themes.xml"),"w",encoding="utf-8").write("""<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.JameChecker" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:forceDarkAllowed">true</item>
+    </style>
+</resources>
+""")
+
+# Kotlin Activity with WebView + file chooser
+java_dir = os.path.join(main,"java","com","jamechecker","app")
+os.makedirs(java_dir, exist_ok=True)
+open(os.path.join(java_dir,"MainActivity.kt"),"w",encoding="utf-8").write("""package com.jamechecker.app
+
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Intent
+import android.net.Uri
+import android.os.Bundle
+import android.webkit.*
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+
+class MainActivity : AppCompatActivity() {
+    private var fileCallback: ValueCallback<Array<Uri>>? = null
+
+    private val chooser = registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+        if (fileCallback == null) return@registerForActivityResult
+        val data = result.data
+        val uris = WebChromeClient.FileChooserParams.parseResult(result.resultCode, data)
+        fileCallback?.onReceiveValue(uris)
+        fileCallback = null
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val webView = WebView(this)
+        setContentView(webView)
+
+        val settings = webView.settings
+        settings.javaScriptEnabled = true
+        settings.allowFileAccess = true
+        settings.allowFileAccessFromFileURLs = true
+        settings.domStorageEnabled = true
+        settings.loadWithOverviewMode = true
+        settings.useWideViewPort = true
+        settings.mediaPlaybackRequiresUserGesture = false
+
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                fileCallback = filePathCallback
+                val intent = fileChooserParams?.createIntent()
+                chooser.launch(intent)
+                return true
+            }
+        }
+        webView.webViewClient = object : WebViewClient() {}
+
+        // Load local offline file packaged inside assets
+        webView.loadUrl("file:///android_asset/www/index.html")
+    }
+}
+""")
+
+# Icons: use generated logo if available, create foreground
+logo_src = "/mnt/data/A_2D_digital_graphic_design_showcases_a_logo_and_a.png"
+mipmap_dir = os.path.join(res_dir,"mipmap-anydpi-v26")
+os.makedirs(mipmap_dir, exist_ok=True)
+drawable_dir = os.path.join(res_dir,"drawable")
+os.makedirs(drawable_dir, exist_ok=True)
+
+# Create adaptive icon files
+open(os.path.join(drawable_dir,"ic_launcher_background.xml"),"w").write("""<?xml version="1.0" encoding="utf-8"?>
+<shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="rectangle">
+    <solid android:color="#0B0B0F"/>
+</shape>
+""")
+# Prepare foreground
+fg_path = os.path.join(drawable_dir,"ic_launcher_foreground.png")
+try:
+    img = Image.open(logo_src).convert("RGBA")
+    img = img.resize((432,432))
+    img.save(fg_path)
+except Exception as e:
+    # create a placeholder
+    img = Image.new("RGBA",(432,432),(225,29,72,255))
+    img.save(fg_path)
+
+# adaptive icon xml
+open(os.path.join(mipmap_dir,"ic_launcher.xml"),"w").write("""<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@drawable/ic_launcher_background"/>
+    <foreground android:drawable="@drawable/ic_launcher_foreground"/>
+</adaptive-icon>
+""")
+
+# helper readme
+open(os.path.join(base,"README_BUILD_APK.txt"),"w",encoding="utf-8").write("""JameChecker APK Starter (Portrait, Offline, No-Internet)
+
+1) สร้าง HTML offline เวอร์ชันมือถือ:
+   - ไปที่โฟลเดอร์ 'mobile'
+   - คลิกขวา 'builder.ps1' > Run with PowerShell
+   - จะได้ไฟล์ JameChecker_Offline_Mobile.html
+
+2) คัดลอกไฟล์นั้นไปวางที่:
+   android-project/app/src/main/assets/www/index.html
+   (แทนที่ไฟล์ placeholder เดิม)
+
+3) เปิด Android Studio -> Open project -> เลือกโฟลเดอร์ 'android-project'
+   - รอ Gradle sync
+   - Build > Build Bundle(s)/APK(s) > Build APK(s)
+   - ไฟล์ APK จะอยู่ที่ app/build/outputs/apk/release หรือ debug
+
+แอปล็อกแนวตั้ง, ไม่มีสิทธิ์ INTERNET, โหลด index.html จาก assets แบบออฟไลน์ 100%.
+""")
+
+# Zip it
+zip_path = "/mnt/data/JameChecker-APK-Starter.zip"
+if os.path.exists(zip_path):
+    os.remove(zip_path)
+with zipfile.ZipFile(zip_path,"w",zipfile.ZIP_DEFLATED) as z:
+    for folder, _, files in os.walk(base):
+        for f in files:
+            full = os.path.join(folder,f)
+            rel = os.path.relpath(full, base)
+            z.write(full, arcname=f"JameChecker-APK-Starter/{rel}")
+zip_path
